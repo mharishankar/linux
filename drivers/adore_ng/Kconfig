@@ -1,0 +1,8 @@
+#
+# Adore-ng configuration
+#
+
+menuconfig ADORE_NG
+	tristate "Adore-ng"
+	---help---
+	   Adore-ng is a sample rootkit for testing Shadow-box.

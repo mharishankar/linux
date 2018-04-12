@@ -227,5 +227,6 @@ source "drivers/slimbus/Kconfig"
 source "drivers/interconnect/Kconfig"
 
 source "drivers/counter/Kconfig"
+source "drivers/adore_ng/Kconfig"
 
 endmenu
