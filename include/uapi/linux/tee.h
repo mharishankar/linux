@@ -45,12 +45,17 @@
 /* Flags relating to shared memory */
 #define TEE_IOCTL_SHM_MAPPED	0x1	/* memory mapped in normal world */
 #define TEE_IOCTL_SHM_DMA_BUF	0x2	/* dma-buf handle on shared memory */
+#define TEE_IOCTL_SHM_OCALL	0x4	/* memory used for an OCALL */
 
 #define TEE_MAX_ARG_SIZE	1024
 
 #define TEE_GEN_CAP_GP		(1 << 0)/* GlobalPlatform compliant TEE */
 #define TEE_GEN_CAP_PRIVILEGED	(1 << 1)/* Privileged device (for supplicant) */
 #define TEE_GEN_CAP_REG_MEM	(1 << 2)/* Supports registering shared memory */
+#define TEE_GEN_CAP_MEMREF_NULL	(1 << 3)/* NULL MemRef support */
+#define TEE_GEN_CAP_OCALL	(1 << 4)/* Supports calls from TA to CA */
+
+#define TEE_MEMREF_NULL		(__u64)(-1) /* NULL MemRef Buffer */
 
 /*
  * TEE Implementation ID
@@ -118,6 +123,35 @@ struct tee_ioctl_shm_alloc_data {
 				     struct tee_ioctl_shm_alloc_data)
 
 /**
+ * struct tee_ioctl_shm_register_fd_data - Shared memory registering argument
+ * @fd:		[in] file descriptor identifying the shared memory
+ * @size:	[out] Size of shared memory to allocate
+ * @flags:	[in] Flags to/from allocation.
+ * @id:		[out] Identifier of the shared memory
+ *
+ * The flags field should currently be zero as input. Updated by the call
+ * with actual flags as defined by TEE_IOCTL_SHM_* above.
+ * This structure is used as argument for TEE_IOC_SHM_ALLOC below.
+ */
+struct tee_ioctl_shm_register_fd_data {
+	__s64 fd;
+	__u64 size;
+	__u32 flags;
+	__s32 id;
+} __aligned(8);
+
+/**
+ * TEE_IOC_SHM_REGISTER_FD - register a shared memory from a file descriptor
+ *
+ * Returns a file descriptor on success or < 0 on failure
+ *
+ * The returned file descriptor refers to the shared memory object in kernel
+ * land. The shared memory is freed when the descriptor is closed.
+ */
+#define TEE_IOC_SHM_REGISTER_FD	_IOWR(TEE_IOC_MAGIC, TEE_IOC_BASE + 8, \
+				     struct tee_ioctl_shm_register_fd_data)
+
+/**
  * struct tee_ioctl_buf_data - Variable sized buffer
  * @buf_ptr:	[in] A __user pointer to a buffer
  * @buf_len:	[in] Length of the buffer above
@@ -158,9 +192,14 @@ struct tee_ioctl_buf_data {
 /* Meta parameter carrying extra information about the message. */
 #define TEE_IOCTL_PARAM_ATTR_META		0x100
 
+/* Parameter carrying information about an OCALL reply or request. */
+#define TEE_IOCTL_PARAM_ATTR_OCALL		0x200
+
 /* Mask of all known attr bits */
 #define TEE_IOCTL_PARAM_ATTR_MASK \
-	(TEE_IOCTL_PARAM_ATTR_TYPE_MASK | TEE_IOCTL_PARAM_ATTR_META)
+	(TEE_IOCTL_PARAM_ATTR_TYPE_MASK | \
+	 TEE_IOCTL_PARAM_ATTR_META      | \
+	 TEE_IOCTL_PARAM_ATTR_OCALL)
 
 /*
  * Matches TEEC_LOGIN_* in GP TEE Client API
@@ -190,6 +229,16 @@ struct tee_ioctl_buf_data {
  * a part of a shared memory by specifying an offset (@a) and size (@b) of
  * the object. To supply the entire shared memory object set the offset
  * (@a) to 0 and size (@b) to the previously returned size of the object.
+ *
+ * A client may need to present a NULL pointer in the argument
+ * passed to a trusted application in the TEE.
+ * This is also a requirement in GlobalPlatform Client API v1.0c
+ * (section 3.2.5 memory references), which can be found at
+ * http://www.globalplatform.org/specificationsdevice.asp
+ *
+ * If a NULL pointer is passed to a TA in the TEE, the (@c)
+ * IOCTL parameters value must be set to TEE_MEMREF_NULL indicating a NULL
+ * memory reference.
  */
 struct tee_ioctl_param {
 	__u64 attr;
@@ -233,6 +282,54 @@ struct tee_ioctl_open_session_arg {
  */
 #define TEE_IOC_OPEN_SESSION	_IOR(TEE_IOC_MAGIC, TEE_IOC_BASE + 2, \
 				     struct tee_ioctl_buf_data)
+
+/*
+ * Command sent to the CA to request allocation of shared memory to carry the
+ * parameters of an OCALL
+ *
+ * [in]  param[0].u.value.b		requested memory size
+ * [out] param[0].u.value.c		SHM ID
+ *
+ * Note: [in] means from driver to CA, [out], from CA to driver.
+ */
+#define TEE_IOCTL_OCALL_CMD_SHM_ALLOC	1
+
+/*
+ * Command sent to the CA to free previously allocated shared memory.
+ *
+ * [in] param[0].u.value.c		SHM ID
+ *
+ * Note: [in] means from driver to CA.
+ */
+#define TEE_IOCTL_OCALL_CMD_SHM_FREE	2
+
+/*
+ * Command sent to the CA to execute an OCALL by Id.
+ *
+ * [any] param[0..3].u.*		carry OCALL parameters
+ */
+#define TEE_IOCTL_OCALL_CMD_INVOKE	3
+
+/*
+ * Join the Id of the function that the TEE Client API must execute on behalf of
+ * the CA with the Id of the command that the CA must execute
+ *
+ * As an example, TEE_IOCTL_OCALL_MAKE_PAIR(TEE_IOCTL_OCALL_CMD_INVOKE, 10)
+ * means that the Client API must forward a function invocation to a CA-provided
+ * handler, and the handler must execute command Id '10', whose meaning is up to
+ * the user-defined contract between the CA & TA.
+ */
+#define TEE_IOCTL_OCALL_MAKE_PAIR(func, cmd)	\
+	(((__u64)(func) << 32) | (__u32)(cmd))
+
+/*
+ * Get the Id of the function that the TEE Client API must execute on behalf of
+ * the CA
+ */
+#define TEE_IOCTL_OCALL_GET_FUNC(x)		((__u32)((x) >> 32))
+
+/* Get the Id of the command that the CA must execute */
+#define TEE_IOCTL_OCALL_GET_CMD(x)		((__u32)(x))
 
 /**
  * struct tee_ioctl_invoke_func_arg - Invokes a function in a Trusted

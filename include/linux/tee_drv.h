@@ -26,6 +26,7 @@
 #define TEE_SHM_REGISTER	BIT(3)  /* Memory registered in secure world */
 #define TEE_SHM_USER_MAPPED	BIT(4)  /* Memory mapped in user space */
 #define TEE_SHM_POOL		BIT(5)  /* Memory allocated from pool */
+#define TEE_SHM_OCALL		BIT(6)  /* Memory used for an OCALL */
 
 struct device;
 struct tee_device;
@@ -46,6 +47,8 @@ struct tee_shm_pool;
  *              and just return with an error code. It is needed for requests
  *              that arises from TEE based kernel drivers that should be
  *              non-blocking in nature.
+ * @cap_memref_null: flag indicating if the TEE Client support shared
+ *                   memory buffer with a NULL pointer.
  */
 struct tee_context {
 	struct tee_device *teedev;
@@ -54,6 +57,8 @@ struct tee_context {
 	struct kref refcount;
 	bool releasing;
 	bool supp_nowait;
+	bool cap_memref_null;
+	bool cap_ocall;
 };
 
 struct tee_param_memref {
@@ -80,6 +85,7 @@ struct tee_param {
  * struct tee_driver_ops - driver operations vtable
  * @get_version:	returns version of driver
  * @open:		called when the device file is opened
+ * @pre_release:	called prior to context release, before release proper
  * @release:		release this open file
  * @open_session:	open a new session
  * @close_session:	close a session
@@ -94,14 +100,19 @@ struct tee_driver_ops {
 	void (*get_version)(struct tee_device *teedev,
 			    struct tee_ioctl_version_data *vers);
 	int (*open)(struct tee_context *ctx);
+	void (*pre_release)(struct tee_context *ctx);
 	void (*release)(struct tee_context *ctx);
 	int (*open_session)(struct tee_context *ctx,
 			    struct tee_ioctl_open_session_arg *arg,
-			    struct tee_param *param);
+			    struct tee_param *normal_param,
+			    u32 num_normal_params,
+			    struct tee_param *ocall_param);
 	int (*close_session)(struct tee_context *ctx, u32 session);
 	int (*invoke_func)(struct tee_context *ctx,
 			   struct tee_ioctl_invoke_arg *arg,
-			   struct tee_param *param);
+			   struct tee_param *normal_param,
+			   u32 num_normal_params,
+			   struct tee_param *ocall_param);
 	int (*cancel_req)(struct tee_context *ctx, u32 cancel_id, u32 session);
 	int (*supp_recv)(struct tee_context *ctx, u32 *func, u32 *num_params,
 			 struct tee_param *param);
@@ -165,6 +176,22 @@ int tee_device_register(struct tee_device *teedev);
  * @teedev is NULL.
  */
 void tee_device_unregister(struct tee_device *teedev);
+
+/**
+ * tee_session_calc_client_uuid() - Calculates client UUID for session
+ * @uuid:		Resulting UUID
+ * @connection_method:	Connection method for session (TEE_IOCTL_LOGIN_*)
+ * @connectuon_data:	Connection data for opening session
+ *
+ * Based on connection method calculates UUIDv5 based client UUID.
+ *
+ * For group based logins verifies that calling process has specified
+ * credentials.
+ *
+ * @return < 0 on failure
+ */
+int tee_session_calc_client_uuid(uuid_t *uuid, u32 connection_method,
+				 const u8 connection_data[TEE_IOCTL_UUID_LEN]);
 
 /**
  * struct tee_shm - shared memory object
@@ -343,6 +370,16 @@ struct tee_shm *tee_shm_register(struct tee_context *ctx, unsigned long addr,
 				 size_t length, u32 flags);
 
 /**
+ * tee_shm_register_fd() - Register shared memory from file descriptor
+ *
+ * @ctx:	Context that allocates the shared memory
+ * @fd:		shared memory file descriptor reference.
+ *
+ * @returns a pointer to 'struct tee_shm'
+ */
+struct tee_shm *tee_shm_register_fd(struct tee_context *ctx, int fd);
+
+/**
  * tee_shm_is_registered() - Check if shared memory object in registered in TEE
  * @shm:	Shared memory handle
  * @returns true if object is registered in TEE
@@ -357,6 +394,12 @@ static inline bool tee_shm_is_registered(struct tee_shm *shm)
  * @shm:	Handle to shared memory to free
  */
 void tee_shm_free(struct tee_shm *shm);
+
+/**
+ * tee_shm_get() - Increase reference count on a shared memory handle
+ * @shm:	Shared memory handle
+ */
+void tee_shm_get(struct tee_shm *shm);
 
 /**
  * tee_shm_put() - Decrease reference count on a shared memory handle
@@ -548,6 +591,48 @@ static inline bool tee_param_is_memref(struct tee_param *param)
 	default:
 		return false;
 	}
+}
+
+static inline bool tee_ioctl_param_is_ocall_reply(struct tee_ioctl_param *param)
+{
+	u64 type = param->attr & TEE_IOCTL_PARAM_ATTR_TYPE_MASK;
+
+	return param->attr & TEE_IOCTL_PARAM_ATTR_OCALL &&
+	       type == TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INOUT &&
+	       param->a;
+}
+
+static inline bool tee_param_is_ocall_request(struct tee_param *param)
+{
+	u64 type = param->attr & TEE_IOCTL_PARAM_ATTR_TYPE_MASK;
+
+	return param->attr & TEE_IOCTL_PARAM_ATTR_OCALL &&
+	       type == TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INOUT &&
+	       param->u.value.a;
+}
+
+static inline bool tee_param_is_ocall_request_safe(struct tee_param *param)
+{
+	return param ? tee_param_is_ocall_request(param) : false;
+}
+
+static inline bool tee_param_is_ocall(struct tee_param *param)
+{
+	u64 type = param->attr & TEE_IOCTL_PARAM_ATTR_TYPE_MASK;
+
+	return param->attr & TEE_IOCTL_PARAM_ATTR_OCALL &&
+	       type == TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INOUT;
+}
+
+static inline void tee_param_clear_ocall(struct tee_param *ocall)
+{
+	if (ocall)
+		memset(&ocall->u, 0, sizeof(ocall->u));
+}
+
+static inline u64 tee_param_get_ocall_func(struct tee_param *param)
+{
+	return TEE_IOCTL_OCALL_GET_FUNC(param->u.value.a);
 }
 
 extern struct bus_type tee_bus_type;

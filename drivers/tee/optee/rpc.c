@@ -1,23 +1,16 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2015-2016, Linaro Limited
- *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/io.h>
 #include <linux/slab.h>
 #include <linux/tee_drv.h>
+#include "optee_bench.h"
 #include "optee_private.h"
 #include "optee_smc.h"
 
@@ -199,14 +192,67 @@ static struct tee_shm *cmd_alloc_suppl(struct tee_context *ctx, size_t sz)
 	return shm;
 }
 
+int optee_rpc_process_shm_alloc(struct tee_shm *shm,
+				struct optee_msg_param *msg_param, void **list)
+{
+	phys_addr_t pa;
+	size_t sz;
+	size_t offs;
+	struct page **pages;
+	size_t page_num;
+	void *pages_list;
+
+	if (tee_shm_get_pa(shm, 0, &pa))
+		return -EINVAL;
+
+	sz = tee_shm_get_size(shm);
+
+	if (tee_shm_is_registered(shm)) {
+		pages = tee_shm_get_pages(shm, &page_num);
+		if (!pages || !page_num)
+			return -EINVAL;
+
+		offs = tee_shm_get_page_offset(shm);
+		if (offs >= OPTEE_MSG_NONCONTIG_PAGE_SIZE)
+			return -EINVAL;
+
+		pages_list = optee_allocate_pages_list(page_num);
+		if (!pages_list)
+			return -ENOMEM;
+
+		/*
+		 * In the least bits of u.tmem.buf_ptr we store buffer offset
+		 * from 4k page, as described in OP-TEE ABI.
+		 */
+
+		msg_param->attr = OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT |
+				  OPTEE_MSG_ATTR_NONCONTIG;
+		msg_param->u.tmem.buf_ptr = virt_to_phys(pages_list) | offs;
+		msg_param->u.tmem.size = sz;
+		msg_param->u.tmem.shm_ref = (unsigned long)shm;
+		optee_fill_pages_list(pages_list, pages, page_num,
+				      tee_shm_get_page_offset(shm));
+		*list = pages_list;
+	} else {
+		msg_param->attr = OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT;
+		msg_param->u.tmem.buf_ptr = pa;
+		msg_param->u.tmem.size = sz;
+		msg_param->u.tmem.shm_ref = (unsigned long)shm;
+		*list = NULL;
+	}
+
+	return 0;
+}
+
 static void handle_rpc_func_cmd_shm_alloc(struct tee_context *ctx,
 					  struct optee_msg_arg *arg,
 					  struct optee_call_ctx *call_ctx)
 {
-	phys_addr_t pa;
 	struct tee_shm *shm;
+	void *pages_list;
 	size_t sz;
 	size_t n;
+	int rc;
 
 	arg->ret_origin = TEEC_ORIGIN_COMMS;
 
@@ -231,6 +277,9 @@ static void handle_rpc_func_cmd_shm_alloc(struct tee_context *ctx,
 	case OPTEE_MSG_RPC_SHM_TYPE_KERNEL:
 		shm = tee_shm_alloc(ctx, sz, TEE_SHM_MAPPED);
 		break;
+	case OPTEE_MSG_RPC_SHM_TYPE_GLOBAL:
+		shm = tee_shm_alloc(ctx, sz, TEE_SHM_MAPPED | TEE_SHM_DMA_BUF);
+		break;
 	default:
 		arg->ret = TEEC_ERROR_BAD_PARAMETERS;
 		return;
@@ -241,52 +290,18 @@ static void handle_rpc_func_cmd_shm_alloc(struct tee_context *ctx,
 		return;
 	}
 
-	if (tee_shm_get_pa(shm, 0, &pa)) {
+	rc = optee_rpc_process_shm_alloc(shm, arg->params, &pages_list);
+	if (rc == -ENOMEM) {
+		arg->ret = TEEC_ERROR_OUT_OF_MEMORY;
+		goto bad;
+	} else if (rc) {
 		arg->ret = TEEC_ERROR_BAD_PARAMETERS;
 		goto bad;
 	}
 
-	sz = tee_shm_get_size(shm);
-
 	if (tee_shm_is_registered(shm)) {
-		struct page **pages;
-		u64 *pages_list;
-		size_t page_num;
-
-		pages = tee_shm_get_pages(shm, &page_num);
-		if (!pages || !page_num) {
-			arg->ret = TEEC_ERROR_OUT_OF_MEMORY;
-			goto bad;
-		}
-
-		pages_list = optee_allocate_pages_list(page_num);
-		if (!pages_list) {
-			arg->ret = TEEC_ERROR_OUT_OF_MEMORY;
-			goto bad;
-		}
-
 		call_ctx->pages_list = pages_list;
-		call_ctx->num_entries = page_num;
-
-		arg->params[0].attr = OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT |
-				      OPTEE_MSG_ATTR_NONCONTIG;
-		/*
-		 * In the least bits of u.tmem.buf_ptr we store buffer offset
-		 * from 4k page, as described in OP-TEE ABI.
-		 */
-		arg->params[0].u.tmem.buf_ptr = virt_to_phys(pages_list) |
-			(tee_shm_get_page_offset(shm) &
-			 (OPTEE_MSG_NONCONTIG_PAGE_SIZE - 1));
-		arg->params[0].u.tmem.size = tee_shm_get_size(shm);
-		arg->params[0].u.tmem.shm_ref = (unsigned long)shm;
-
-		optee_fill_pages_list(pages_list, pages, page_num,
-				      tee_shm_get_page_offset(shm));
-	} else {
-		arg->params[0].attr = OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT;
-		arg->params[0].u.tmem.buf_ptr = pa;
-		arg->params[0].u.tmem.size = sz;
-		arg->params[0].u.tmem.shm_ref = (unsigned long)shm;
+		call_ctx->num_entries = shm->num_pages;
 	}
 
 	arg->ret = TEEC_SUCCESS;
@@ -339,6 +354,7 @@ static void handle_rpc_func_cmd_shm_free(struct tee_context *ctx,
 		cmd_free_suppl(ctx, shm);
 		break;
 	case OPTEE_MSG_RPC_SHM_TYPE_KERNEL:
+	case OPTEE_MSG_RPC_SHM_TYPE_GLOBAL:
 		tee_shm_free(shm);
 		break;
 	default:
@@ -360,6 +376,50 @@ static void free_pages_list(struct optee_call_ctx *call_ctx)
 void optee_rpc_finalize_call(struct optee_call_ctx *call_ctx)
 {
 	free_pages_list(call_ctx);
+}
+
+static void handle_rpc_func_cmd_bm_reg(struct optee_msg_arg *arg)
+{
+	u64 size;
+	u64 type;
+	u64 paddr;
+
+	if (arg->num_params != 1)
+		goto bad;
+
+	if ((arg->params[0].attr & OPTEE_MSG_ATTR_TYPE_MASK) !=
+			OPTEE_MSG_ATTR_TYPE_VALUE_INPUT)
+		goto bad;
+
+	type = arg->params[0].u.value.a;
+	switch (type) {
+	case OPTEE_MSG_RPC_CMD_BENCH_REG_NEW:
+		size = arg->params[0].u.value.c;
+		paddr = arg->params[0].u.value.b;
+		down_write(&optee_bench_ts_rwsem);
+		optee_bench_ts_global =
+			memremap(paddr, size, MEMREMAP_WB);
+		if (!optee_bench_ts_global) {
+			up_write(&optee_bench_ts_rwsem);
+			goto bad;
+		}
+		up_write(&optee_bench_ts_rwsem);
+		break;
+	case OPTEE_MSG_RPC_CMD_BENCH_REG_DEL:
+		down_write(&optee_bench_ts_rwsem);
+		if (optee_bench_ts_global)
+			memunmap(optee_bench_ts_global);
+		optee_bench_ts_global = NULL;
+		up_write(&optee_bench_ts_rwsem);
+		break;
+	default:
+		goto bad;
+	}
+
+	arg->ret = TEEC_SUCCESS;
+	return;
+bad:
+	arg->ret = TEEC_ERROR_BAD_PARAMETERS;
 }
 
 static void handle_rpc_func_cmd(struct tee_context *ctx, struct optee *optee,
@@ -390,6 +450,9 @@ static void handle_rpc_func_cmd(struct tee_context *ctx, struct optee *optee,
 		break;
 	case OPTEE_MSG_RPC_CMD_SHM_FREE:
 		handle_rpc_func_cmd_shm_free(ctx, arg);
+		break;
+	case OPTEE_MSG_RPC_CMD_BENCH_REG:
+		handle_rpc_func_cmd_bm_reg(arg);
 		break;
 	default:
 		handle_rpc_supp_cmd(ctx, arg);
@@ -449,4 +512,39 @@ void optee_handle_rpc(struct tee_context *ctx, struct optee_rpc_param *param,
 	}
 
 	param->a0 = OPTEE_SMC_CALL_RETURN_FROM_RPC;
+}
+
+bool optee_rpc_is_ocall(struct optee_rpc_param *param,
+			struct optee_call_ctx *call_ctx)
+{
+	u32 func;
+	u64 shm_type;
+
+	struct tee_shm *shm;
+	struct optee_msg_arg *arg;
+
+	func = OPTEE_SMC_RETURN_GET_RPC_FUNC(param->a0);
+	if (func != OPTEE_SMC_RPC_FUNC_CMD)
+		return false;
+
+	shm = reg_pair_to_ptr(param->a1, param->a2);
+	arg = tee_shm_get_va(shm, 0);
+
+	switch (arg->cmd) {
+	case OPTEE_MSG_RPC_CMD_SHM_ALLOC:
+	case OPTEE_MSG_RPC_CMD_SHM_FREE:
+		shm_type = arg->params[0].u.value.a;
+		if (shm_type != OPTEE_MSG_RPC_SHM_TYPE_CLIENT_APPL)
+			break;
+		fallthrough;
+	case OPTEE_MSG_RPC_CMD_OCALL:
+		call_ctx->rpc_shm = shm;
+		call_ctx->rpc_arg = arg;
+		call_ctx->thread_id = param->a3;
+		return true;
+	default:
+		break;
+	}
+
+	return false;
 }

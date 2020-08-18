@@ -1,32 +1,37 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2015-2016, Linaro Limited
- *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
  */
 
 #define pr_fmt(fmt) "%s: " fmt, __func__
 
 #include <linux/cdev.h>
-#include <linux/device.h>
+#include <linux/cred.h>
 #include <linux/fs.h>
 #include <linux/idr.h>
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/tee_drv.h>
 #include <linux/uaccess.h>
+#include <crypto/hash.h>
+#include <crypto/sha.h>
 #include "tee_private.h"
 
 #define TEE_NUM_DEVICES	32
 
 #define TEE_IOCTL_PARAM_SIZE(x) (sizeof(struct tee_param) * (x))
+
+#define TEE_UUID_NS_NAME_SIZE	128
+
+/*
+ * TEE Client UUID name space identifier (UUIDv4)
+ *
+ * Value here is random UUID that is allocated as name space identifier for
+ * forming Client UUID's for TEE environment using UUIDv5 scheme.
+ */
+static const uuid_t tee_client_uuid_ns = UUID_INIT(0x58ac9ca0, 0x2086, 0x4683,
+						   0xa1, 0xb8, 0xec, 0x4b,
+						   0xc0, 0x8e, 0x01, 0xb6);
 
 /*
  * Unprivileged devices in the lower half range and privileged devices in
@@ -38,15 +43,13 @@ static DEFINE_SPINLOCK(driver_lock);
 static struct class *tee_class;
 static dev_t tee_devt;
 
-static int tee_open(struct inode *inode, struct file *filp)
+static struct tee_context *teedev_open(struct tee_device *teedev)
 {
 	int rc;
-	struct tee_device *teedev;
 	struct tee_context *ctx;
 
-	teedev = container_of(inode->i_cdev, struct tee_device, cdev);
 	if (!tee_device_get(teedev))
-		return -EINVAL;
+		return ERR_PTR(-EINVAL);
 
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx) {
@@ -57,16 +60,16 @@ static int tee_open(struct inode *inode, struct file *filp)
 	kref_init(&ctx->refcount);
 	ctx->teedev = teedev;
 	INIT_LIST_HEAD(&ctx->list_shm);
-	filp->private_data = ctx;
 	rc = teedev->desc->ops->open(ctx);
 	if (rc)
 		goto err;
 
-	return 0;
+	return ctx;
 err:
 	kfree(ctx);
 	tee_device_put(teedev);
-	return rc;
+	return ERR_PTR(rc);
+
 }
 
 void teedev_ctx_get(struct tee_context *ctx)
@@ -96,8 +99,27 @@ void teedev_ctx_put(struct tee_context *ctx)
 
 static void teedev_close_context(struct tee_context *ctx)
 {
+	if (ctx->teedev->desc->ops->pre_release)
+		ctx->teedev->desc->ops->pre_release(ctx);
 	tee_device_put(ctx->teedev);
 	teedev_ctx_put(ctx);
+}
+
+static int tee_open(struct inode *inode, struct file *filp)
+{
+	struct tee_context *ctx;
+
+	ctx = teedev_open(container_of(inode->i_cdev, struct tee_device, cdev));
+	if (IS_ERR(ctx))
+		return PTR_ERR(ctx);
+
+	/*
+	 * Default user-space behaviour is to wait for tee-supplicant
+	 * if not present for any requests in this context.
+	 */
+	ctx->supp_nowait = false;
+	filp->private_data = ctx;
+	return 0;
 }
 
 static int tee_release(struct inode *inode, struct file *filp)
@@ -105,6 +127,134 @@ static int tee_release(struct inode *inode, struct file *filp)
 	teedev_close_context(filp->private_data);
 	return 0;
 }
+
+/**
+ * uuid_v5() - Calculate UUIDv5
+ * @uuid: Resulting UUID
+ * @ns: Name space ID for UUIDv5 function
+ * @name: Name for UUIDv5 function
+ * @size: Size of name
+ *
+ * UUIDv5 is specific in RFC 4122.
+ *
+ * This implements section (for SHA-1):
+ * 4.3.  Algorithm for Creating a Name-Based UUID
+ */
+static int uuid_v5(uuid_t *uuid, const uuid_t *ns, const void *name,
+		   size_t size)
+{
+	unsigned char hash[SHA1_DIGEST_SIZE];
+	struct crypto_shash *shash = NULL;
+	struct shash_desc *desc = NULL;
+	int rc;
+
+	shash = crypto_alloc_shash("sha1", 0, 0);
+	if (IS_ERR(shash)) {
+		rc = PTR_ERR(shash);
+		pr_err("shash(sha1) allocation failed\n");
+		return rc;
+	}
+
+	desc = kzalloc(sizeof(*desc) + crypto_shash_descsize(shash),
+		       GFP_KERNEL);
+	if (IS_ERR(desc)) {
+		rc = PTR_ERR(desc);
+		goto out;
+	}
+
+	desc->tfm = shash;
+
+	rc = crypto_shash_init(desc);
+	if (rc < 0)
+		goto out2;
+
+	rc = crypto_shash_update(desc, (const u8 *)ns, sizeof(*ns));
+	if (rc < 0)
+		goto out2;
+
+	rc = crypto_shash_update(desc, (const u8 *)name, size);
+	if (rc < 0)
+		goto out2;
+
+	rc = crypto_shash_final(desc, hash);
+	if (rc < 0)
+		goto out2;
+
+	memcpy(uuid->b, hash, UUID_SIZE);
+
+	/* Tag for version 5 */
+	uuid->b[6] = (hash[6] & 0x0F) | 0x50;
+	uuid->b[8] = (hash[8] & 0x3F) | 0x80;
+
+out2:
+	kfree(desc);
+
+out:
+	crypto_free_shash(shash);
+	return rc;
+}
+
+int tee_session_calc_client_uuid(uuid_t *uuid, u32 connection_method,
+				 const u8 connection_data[TEE_IOCTL_UUID_LEN])
+{
+	const char *application_id = NULL;
+	gid_t ns_grp = (gid_t)-1;
+	kgid_t grp = INVALID_GID;
+	char *name = NULL;
+	int rc;
+
+	if (connection_method == TEE_IOCTL_LOGIN_PUBLIC) {
+		/* Nil UUID to be passed to TEE environment */
+		uuid_copy(uuid, &uuid_null);
+		return 0;
+	}
+
+	/*
+	 * In Linux environment client UUID is based on UUIDv5.
+	 *
+	 * Determine client UUID with following semantics for 'name':
+	 *
+	 * For TEEC_LOGIN_USER:
+	 * uid=<uid>
+	 *
+	 * For TEEC_LOGIN_GROUP:
+	 * gid=<gid>
+	 *
+	 */
+
+	name = kzalloc(TEE_UUID_NS_NAME_SIZE, GFP_KERNEL);
+	if (!name)
+		return -ENOMEM;
+
+	switch (connection_method) {
+	case TEE_IOCTL_LOGIN_USER:
+		scnprintf(name, TEE_UUID_NS_NAME_SIZE, "uid=%x",
+			  current_euid().val);
+		break;
+
+	case TEE_IOCTL_LOGIN_GROUP:
+		memcpy(&ns_grp, connection_data, sizeof(gid_t));
+		grp = make_kgid(current_user_ns(), ns_grp);
+		if (!gid_valid(grp) || !in_egroup_p(grp)) {
+			rc = -EPERM;
+			goto out;
+		}
+
+		scnprintf(name, TEE_UUID_NS_NAME_SIZE, "gid=%x", grp.val);
+		break;
+
+	default:
+		rc = -EINVAL;
+		goto out;
+	}
+
+	rc = uuid_v5(uuid, &tee_client_uuid_ns, name, strlen(name));
+out:
+	kfree(name);
+
+	return rc;
+}
+EXPORT_SYMBOL_GPL(tee_session_calc_client_uuid);
 
 static int tee_ioctl_version(struct tee_context *ctx,
 			     struct tee_ioctl_version_data __user *uvers)
@@ -163,18 +313,20 @@ tee_ioctl_shm_register(struct tee_context *ctx,
 		       struct tee_ioctl_shm_register_data __user *udata)
 {
 	long ret;
+	u32 flags = TEE_SHM_DMA_BUF | TEE_SHM_USER_MAPPED;
 	struct tee_ioctl_shm_register_data data;
 	struct tee_shm *shm;
 
 	if (copy_from_user(&data, udata, sizeof(data)))
 		return -EFAULT;
 
-	/* Currently no input flags are supported */
-	if (data.flags)
+	if (data.flags & ~TEE_IOCTL_SHM_OCALL)
 		return -EINVAL;
 
-	shm = tee_shm_register(ctx, data.addr, data.length,
-			       TEE_SHM_DMA_BUF | TEE_SHM_USER_MAPPED);
+	if (data.flags & TEE_IOCTL_SHM_OCALL)
+		flags |= TEE_SHM_OCALL;
+
+	shm = tee_shm_register(ctx, data.addr, data.length, flags);
 	if (IS_ERR(shm))
 		return PTR_ERR(shm);
 
@@ -195,9 +347,86 @@ tee_ioctl_shm_register(struct tee_context *ctx,
 	return ret;
 }
 
-static int params_from_user(struct tee_context *ctx, struct tee_param *params,
-			    size_t num_params,
-			    struct tee_ioctl_param __user *uparams)
+static int tee_ioctl_shm_register_fd(struct tee_context *ctx,
+			struct tee_ioctl_shm_register_fd_data __user *udata)
+{
+	struct tee_ioctl_shm_register_fd_data data;
+	struct tee_shm *shm;
+	long ret;
+
+	if (copy_from_user(&data, udata, sizeof(data)))
+		return -EFAULT;
+
+	/* Currently no input flags are supported */
+	if (data.flags)
+		return -EINVAL;
+
+	shm = tee_shm_register_fd(ctx, data.fd);
+	if (IS_ERR_OR_NULL(shm))
+		return -EINVAL;
+
+	data.id = shm->id;
+	data.flags = shm->flags;
+	data.size = shm->size;
+
+	if (copy_to_user(udata, &data, sizeof(data)))
+		ret = -EFAULT;
+	else
+		ret = tee_shm_get_fd(shm);
+
+	/*
+	 * When user space closes the file descriptor the shared memory
+	 * should be freed or if tee_shm_get_fd() failed then it will
+	 * be freed immediately.
+	 */
+	tee_shm_put(shm);
+	return ret;
+}
+
+static struct tee_shm *shm_from_user(struct tee_context *ctx,
+				     struct tee_ioctl_param *ip)
+{
+	struct tee_shm *shm = ERR_PTR(-EINVAL);
+
+	/*
+	 * If a NULL pointer is passed to a TA in the TEE,
+	 * the ip->c IOCTL parameters is set to TEE_MEMREF_NULL
+	 * indicating a NULL memory reference.
+	 */
+	if (ip->c != TEE_MEMREF_NULL) {
+		/*
+		 * If we fail to get a pointer to a shared
+		 * memory object (and increase the ref count)
+		 * from an identifier we return an error. All
+		 * pointers that has been added in params have
+		 * an increased ref count. It's the callers
+		 * responibility to do tee_shm_put() on all
+		 * resolved pointers.
+		 */
+		shm = tee_shm_get_from_id(ctx, ip->c);
+		if (IS_ERR(shm))
+			return shm;
+
+		/*
+		 * Ensure offset + size does not overflow
+		 * offset and does not overflow the size of
+		 * the referred shared memory object.
+		 */
+		if ((ip->a + ip->b) < ip->a || (ip->a + ip->b) > shm->size) {
+			tee_shm_put(shm);
+			return ERR_PTR(-EINVAL);
+		}
+	} else if (ctx->cap_memref_null) {
+		/* Pass NULL pointer to OP-TEE */
+		shm = NULL;
+	}
+
+	return shm;
+}
+
+static int params_from_user_normal(struct tee_context *ctx,
+				   struct tee_param *params, size_t num_params,
+				   struct tee_ioctl_param __user *uparams)
 {
 	size_t n;
 
@@ -226,28 +455,9 @@ static int params_from_user(struct tee_context *ctx, struct tee_param *params,
 		case TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_INPUT:
 		case TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_OUTPUT:
 		case TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_INOUT:
-			/*
-			 * If we fail to get a pointer to a shared memory
-			 * object (and increase the ref count) from an
-			 * identifier we return an error. All pointers that
-			 * has been added in params have an increased ref
-			 * count. It's the callers responibility to do
-			 * tee_shm_put() on all resolved pointers.
-			 */
-			shm = tee_shm_get_from_id(ctx, ip.c);
+			shm = shm_from_user(ctx, &ip);
 			if (IS_ERR(shm))
 				return PTR_ERR(shm);
-
-			/*
-			 * Ensure offset + size does not overflow offset
-			 * and does not overflow the size of the referred
-			 * shared memory object.
-			 */
-			if ((ip.a + ip.b) < ip.a ||
-			    (ip.a + ip.b) > shm->size) {
-				tee_shm_put(shm);
-				return -EINVAL;
-			}
 
 			params[n].u.memref.shm_offs = ip.a;
 			params[n].u.memref.size = ip.b;
@@ -261,8 +471,79 @@ static int params_from_user(struct tee_context *ctx, struct tee_param *params,
 	return 0;
 }
 
-static int params_to_user(struct tee_ioctl_param __user *uparams,
-			  size_t num_params, struct tee_param *params)
+static int params_from_user_ocall(struct tee_context *ctx,
+				  struct tee_param *params, size_t num_params,
+				  struct tee_ioctl_param __user *uparams)
+{
+	size_t n;
+
+	for (n = 0; n < num_params; n++) {
+		struct tee_shm *shm;
+		struct tee_ioctl_param ip;
+
+		if (copy_from_user(&ip, uparams + n, sizeof(ip)))
+			return -EFAULT;
+
+		/* All unused attribute bits has to be zero */
+		if (ip.attr & ~TEE_IOCTL_PARAM_ATTR_MASK)
+			return -EINVAL;
+
+		params[n].attr = ip.attr;
+		switch (ip.attr & TEE_IOCTL_PARAM_ATTR_TYPE_MASK) {
+		case TEE_IOCTL_PARAM_ATTR_TYPE_NONE:
+		case TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INPUT:
+			break;
+		case TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_OUTPUT:
+		case TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INOUT:
+			params[n].u.value.a = ip.a;
+			params[n].u.value.b = ip.b;
+			params[n].u.value.c = ip.c;
+			break;
+		case TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_INPUT:
+		case TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_OUTPUT:
+		case TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_INOUT:
+			shm = shm_from_user(ctx, &ip);
+			if (IS_ERR(shm))
+				return PTR_ERR(shm);
+
+			/*
+			 * Reference counting for OCALL memref parameters is
+			 * handled by the TEE-specific driver as necessary.
+			 */
+			if (shm)
+				tee_shm_put(shm);
+
+			params[n].u.memref.shm_offs = ip.a;
+			params[n].u.memref.size = ip.b;
+			params[n].u.memref.shm = shm;
+			break;
+		default:
+			/* Unknown attribute */
+			return -EINVAL;
+		}
+	}
+	return 0;
+}
+
+static int params_from_user(struct tee_context *ctx, struct tee_param *params,
+			    size_t num_params,
+			    struct tee_ioctl_param __user *uparams)
+{
+	struct tee_ioctl_param ip;
+
+	if (!num_params)
+		return 0;
+
+	if (copy_from_user(&ip, uparams, sizeof(ip)))
+		return -EFAULT;
+
+	return tee_ioctl_param_is_ocall_reply(&ip)
+		? params_from_user_ocall(ctx, params, num_params, uparams)
+		: params_from_user_normal(ctx, params, num_params, uparams);
+}
+
+static int params_to_user_normal(struct tee_ioctl_param __user *uparams,
+				 size_t num_params, struct tee_param *params)
 {
 	size_t n;
 
@@ -270,7 +551,7 @@ static int params_to_user(struct tee_ioctl_param __user *uparams,
 		struct tee_ioctl_param __user *up = uparams + n;
 		struct tee_param *p = params + n;
 
-		switch (p->attr) {
+		switch (p->attr & TEE_IOCTL_PARAM_ATTR_TYPE_MASK) {
 		case TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_OUTPUT:
 		case TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INOUT:
 			if (put_user(p->u.value.a, &up->a) ||
@@ -289,6 +570,87 @@ static int params_to_user(struct tee_ioctl_param __user *uparams,
 	return 0;
 }
 
+static int params_to_user_ocall(struct tee_ioctl_param __user *uparams,
+				size_t num_params, struct tee_param *params)
+{
+	size_t n;
+
+	for (n = 0; n < num_params; n++) {
+		struct tee_ioctl_param __user *up = uparams + n;
+		struct tee_param *p = params + n;
+
+		if (put_user(p->attr, &up->attr))
+			return -EFAULT;
+
+		switch (p->attr & TEE_IOCTL_PARAM_ATTR_TYPE_MASK) {
+		case TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INPUT:
+		case TEE_IOCTL_PARAM_ATTR_TYPE_VALUE_INOUT:
+			if (put_user(p->u.value.a, &up->a) ||
+			    put_user(p->u.value.b, &up->b) ||
+			    put_user(p->u.value.c, &up->c))
+				return -EFAULT;
+			break;
+		case TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_INPUT:
+		case TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_OUTPUT:
+		case TEE_IOCTL_PARAM_ATTR_TYPE_MEMREF_INOUT:
+			if (p->u.memref.shm) {
+				if ((put_user((u64)p->u.memref.shm_offs,
+					      &up->a) ||
+				     put_user((u64)p->u.memref.size, &up->b) ||
+				     put_user(p->u.memref.shm->id, &up->c)))
+					return -EFAULT;
+			} else {
+				if (put_user(0, &up->a) ||
+				    put_user(0, &up->b) ||
+				    put_user(TEE_MEMREF_NULL, &up->c))
+					return -EFAULT;
+			}
+			break;
+		default:
+			break;
+		}
+	}
+	return 0;
+}
+
+static int params_to_user(struct tee_ioctl_param __user *uparams,
+			  size_t num_params, struct tee_param *params)
+{
+	if (!num_params)
+		return 0;
+
+	return tee_param_is_ocall_request(params)
+		? params_to_user_ocall(uparams, num_params, params)
+		: params_to_user_normal(uparams, num_params, params);
+}
+
+static inline int find_ocall_param(struct tee_param *params, u32 num_params,
+				   struct tee_param **normal_params,
+				   u32 *num_normal_params,
+				   struct tee_param **ocall_param)
+{
+	size_t n;
+
+	for (n = 0; n < num_params; n++) {
+		if (tee_param_is_ocall(params + n)) {
+			if (n == 0) {
+				*normal_params = params + 1;
+				*num_normal_params = num_params - 1;
+				*ocall_param = params;
+				return 0;
+			} else {
+				return -EINVAL;
+			}
+		}
+	}
+
+	*normal_params = params;
+	*num_normal_params = num_params;
+	*ocall_param = NULL;
+
+	return 0;
+}
+
 static int tee_ioctl_open_session(struct tee_context *ctx,
 				  struct tee_ioctl_buf_data __user *ubuf)
 {
@@ -299,6 +661,9 @@ static int tee_ioctl_open_session(struct tee_context *ctx,
 	struct tee_ioctl_open_session_arg arg;
 	struct tee_ioctl_param __user *uparams = NULL;
 	struct tee_param *params = NULL;
+	struct tee_param *ocall_param = NULL;
+	struct tee_param *normal_params = NULL;
+	u32 num_normal_params = 0;
 	bool have_session = false;
 
 	if (!ctx->teedev->desc->ops->open_session)
@@ -327,9 +692,15 @@ static int tee_ioctl_open_session(struct tee_context *ctx,
 		rc = params_from_user(ctx, params, arg.num_params, uparams);
 		if (rc)
 			goto out;
+		rc = find_ocall_param(params, arg.num_params, &normal_params,
+				      &num_normal_params, &ocall_param);
+		if (rc)
+			goto out;
 	}
 
-	rc = ctx->teedev->desc->ops->open_session(ctx, &arg, params);
+	rc = ctx->teedev->desc->ops->open_session(ctx, &arg, normal_params,
+						  num_normal_params,
+						  ocall_param);
 	if (rc)
 		goto out;
 	have_session = true;
@@ -351,10 +722,11 @@ out:
 
 	if (params) {
 		/* Decrease ref count for all valid shared memory pointers */
-		for (n = 0; n < arg.num_params; n++)
-			if (tee_param_is_memref(params + n) &&
-			    params[n].u.memref.shm)
-				tee_shm_put(params[n].u.memref.shm);
+		if (!tee_param_is_ocall_request_safe(ocall_param))
+			for (n = 0; n < arg.num_params; n++)
+				if (tee_param_is_memref(params + n) &&
+				    params[n].u.memref.shm)
+					tee_shm_put(params[n].u.memref.shm);
 		kfree(params);
 	}
 
@@ -371,6 +743,9 @@ static int tee_ioctl_invoke(struct tee_context *ctx,
 	struct tee_ioctl_invoke_arg arg;
 	struct tee_ioctl_param __user *uparams = NULL;
 	struct tee_param *params = NULL;
+	struct tee_param *ocall_param = NULL;
+	struct tee_param *normal_params = NULL;
+	u32 num_normal_params = 0;
 
 	if (!ctx->teedev->desc->ops->invoke_func)
 		return -EINVAL;
@@ -398,9 +773,23 @@ static int tee_ioctl_invoke(struct tee_context *ctx,
 		rc = params_from_user(ctx, params, arg.num_params, uparams);
 		if (rc)
 			goto out;
+
+		/*
+		 * The OCALL parameter must be first so that we know how to
+		 * process the remainder of the parameters, or not be present at
+		 * all. This function returns an error if the OCALL parameter is
+		 * found in the wrong place. If it is not found, 'ocall_param'
+		 * remains NULL.
+		 */
+		rc = find_ocall_param(params, arg.num_params, &normal_params,
+				      &num_normal_params, &ocall_param);
+		if (rc)
+			goto out;
 	}
 
-	rc = ctx->teedev->desc->ops->invoke_func(ctx, &arg, params);
+	rc = ctx->teedev->desc->ops->invoke_func(ctx, &arg, normal_params,
+						 num_normal_params,
+						 ocall_param);
 	if (rc)
 		goto out;
 
@@ -412,11 +801,22 @@ static int tee_ioctl_invoke(struct tee_context *ctx,
 	rc = params_to_user(uparams, arg.num_params, params);
 out:
 	if (params) {
-		/* Decrease ref count for all valid shared memory pointers */
-		for (n = 0; n < arg.num_params; n++)
-			if (tee_param_is_memref(params + n) &&
-			    params[n].u.memref.shm)
-				tee_shm_put(params[n].u.memref.shm);
+		/*
+		 * Decrease the ref count for all valid shared memory pointers
+		 * if this is a normal return. If returning with an OCALL
+		 * request, the parameters should have been overwritten with
+		 * those of the OCALL. The original parameters, and thus the
+		 * memrefs carrying the SHMs whose ref count was increased on
+		 * entry, shall be restored once the full OCALL sequence is
+		 * finished. When that happens, we decrease the ref count on
+		 * them. Otherwise, we leave the SHMs be; the TEE-specific
+		 * driver should have dealt with their ref counts already.
+		 */
+		if (!tee_param_is_ocall_request_safe(ocall_param))
+			for (n = 0; n < arg.num_params; n++)
+				if (tee_param_is_memref(params + n) &&
+				    params[n].u.memref.shm)
+					tee_shm_put(params[n].u.memref.shm);
 		kfree(params);
 	}
 	return rc;
@@ -648,6 +1048,8 @@ static long tee_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		return tee_ioctl_shm_alloc(ctx, uarg);
 	case TEE_IOC_SHM_REGISTER:
 		return tee_ioctl_shm_register(ctx, uarg);
+	case TEE_IOC_SHM_REGISTER_FD:
+		return tee_ioctl_shm_register_fd(ctx, uarg);
 	case TEE_IOC_OPEN_SESSION:
 		return tee_ioctl_open_session(ctx, uarg);
 	case TEE_IOC_INVOKE:
@@ -670,7 +1072,7 @@ static const struct file_operations tee_fops = {
 	.open = tee_open,
 	.release = tee_release,
 	.unlocked_ioctl = tee_ioctl,
-	.compat_ioctl = tee_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
 };
 
 static void tee_release_device(struct device *dev)
@@ -928,6 +1330,173 @@ void *tee_get_drvdata(struct tee_device *teedev)
 }
 EXPORT_SYMBOL_GPL(tee_get_drvdata);
 
+struct match_dev_data {
+	struct tee_ioctl_version_data *vers;
+	const void *data;
+	int (*match)(struct tee_ioctl_version_data *, const void *);
+};
+
+static int match_dev(struct device *dev, const void *data)
+{
+	const struct match_dev_data *match_data = data;
+	struct tee_device *teedev = container_of(dev, struct tee_device, dev);
+
+	teedev->desc->ops->get_version(teedev, match_data->vers);
+	return match_data->match(match_data->vers, match_data->data);
+}
+
+struct tee_context *
+tee_client_open_context(struct tee_context *start,
+			int (*match)(struct tee_ioctl_version_data *,
+				     const void *),
+			const void *data, struct tee_ioctl_version_data *vers)
+{
+	struct device *dev = NULL;
+	struct device *put_dev = NULL;
+	struct tee_context *ctx = NULL;
+	struct tee_ioctl_version_data v;
+	struct match_dev_data match_data = { vers ? vers : &v, data, match };
+
+	if (start)
+		dev = &start->teedev->dev;
+
+	do {
+		dev = class_find_device(tee_class, dev, &match_data, match_dev);
+		if (!dev) {
+			ctx = ERR_PTR(-ENOENT);
+			break;
+		}
+
+		put_device(put_dev);
+		put_dev = dev;
+
+		ctx = teedev_open(container_of(dev, struct tee_device, dev));
+	} while (IS_ERR(ctx) && PTR_ERR(ctx) != -ENOMEM);
+
+	put_device(put_dev);
+	/*
+	 * Default behaviour for in kernel client is to not wait for
+	 * tee-supplicant if not present for any requests in this context.
+	 * Also this flag could be configured again before call to
+	 * tee_client_open_session() if any in kernel client requires
+	 * different behaviour.
+	 */
+	if (!IS_ERR(ctx))
+		ctx->supp_nowait = true;
+
+	return ctx;
+}
+EXPORT_SYMBOL_GPL(tee_client_open_context);
+
+void tee_client_close_context(struct tee_context *ctx)
+{
+	teedev_close_context(ctx);
+}
+EXPORT_SYMBOL_GPL(tee_client_close_context);
+
+void tee_client_get_version(struct tee_context *ctx,
+			    struct tee_ioctl_version_data *vers)
+{
+	ctx->teedev->desc->ops->get_version(ctx->teedev, vers);
+}
+EXPORT_SYMBOL_GPL(tee_client_get_version);
+
+int tee_client_open_session(struct tee_context *ctx,
+			    struct tee_ioctl_open_session_arg *arg,
+			    struct tee_param *param)
+{
+	struct tee_param *ocall_param = NULL;
+	struct tee_param *normal_params = NULL;
+	u32 num_normal_params = 0;
+	int rc;
+
+	if (!ctx->teedev->desc->ops->open_session)
+		return -EINVAL;
+
+	rc = find_ocall_param(param, arg->num_params, &normal_params,
+			      &num_normal_params, &ocall_param);
+	if (rc)
+		return rc;
+
+	return ctx->teedev->desc->ops->open_session(ctx, arg, normal_params,
+						    num_normal_params,
+						    ocall_param);
+}
+EXPORT_SYMBOL_GPL(tee_client_open_session);
+
+int tee_client_close_session(struct tee_context *ctx, u32 session)
+{
+	if (!ctx->teedev->desc->ops->close_session)
+		return -EINVAL;
+	return ctx->teedev->desc->ops->close_session(ctx, session);
+}
+EXPORT_SYMBOL_GPL(tee_client_close_session);
+
+int tee_client_invoke_func(struct tee_context *ctx,
+			   struct tee_ioctl_invoke_arg *arg,
+			   struct tee_param *param)
+{
+	struct tee_param *ocall_param = NULL;
+	struct tee_param *normal_params = NULL;
+	u32 num_normal_params = 0;
+	int rc;
+
+	if (!ctx->teedev->desc->ops->invoke_func)
+		return -EINVAL;
+
+	rc = find_ocall_param(param, arg->num_params, &normal_params,
+			      &num_normal_params, &ocall_param);
+	if (rc)
+		return rc;
+
+	return ctx->teedev->desc->ops->invoke_func(ctx, arg, normal_params,
+						   num_normal_params,
+						   ocall_param);
+}
+EXPORT_SYMBOL_GPL(tee_client_invoke_func);
+
+int tee_client_cancel_req(struct tee_context *ctx,
+			  struct tee_ioctl_cancel_arg *arg)
+{
+	if (!ctx->teedev->desc->ops->cancel_req)
+		return -EINVAL;
+	return ctx->teedev->desc->ops->cancel_req(ctx, arg->cancel_id,
+						  arg->session);
+}
+
+static int tee_client_device_match(struct device *dev,
+				   struct device_driver *drv)
+{
+	const struct tee_client_device_id *id_table;
+	struct tee_client_device *tee_device;
+
+	id_table = to_tee_client_driver(drv)->id_table;
+	tee_device = to_tee_client_device(dev);
+
+	while (!uuid_is_null(&id_table->uuid)) {
+		if (uuid_equal(&tee_device->id.uuid, &id_table->uuid))
+			return 1;
+		id_table++;
+	}
+
+	return 0;
+}
+
+static int tee_client_device_uevent(struct device *dev,
+				    struct kobj_uevent_env *env)
+{
+	uuid_t *dev_id = &to_tee_client_device(dev)->id.uuid;
+
+	return add_uevent_var(env, "MODALIAS=tee:%pUb", dev_id);
+}
+
+struct bus_type tee_bus_type = {
+	.name		= "tee",
+	.match		= tee_client_device_match,
+	.uevent		= tee_client_device_uevent,
+};
+EXPORT_SYMBOL_GPL(tee_bus_type);
+
 static int __init tee_init(void)
 {
 	int rc;
@@ -941,18 +1510,32 @@ static int __init tee_init(void)
 	rc = alloc_chrdev_region(&tee_devt, 0, TEE_NUM_DEVICES, "tee");
 	if (rc) {
 		pr_err("failed to allocate char dev region\n");
-		class_destroy(tee_class);
-		tee_class = NULL;
+		goto out_unreg_class;
 	}
+
+	rc = bus_register(&tee_bus_type);
+	if (rc) {
+		pr_err("failed to register tee bus\n");
+		goto out_unreg_chrdev;
+	}
+
+	return 0;
+
+out_unreg_chrdev:
+	unregister_chrdev_region(tee_devt, TEE_NUM_DEVICES);
+out_unreg_class:
+	class_destroy(tee_class);
+	tee_class = NULL;
 
 	return rc;
 }
 
 static void __exit tee_exit(void)
 {
+	bus_unregister(&tee_bus_type);
+	unregister_chrdev_region(tee_devt, TEE_NUM_DEVICES);
 	class_destroy(tee_class);
 	tee_class = NULL;
-	unregister_chrdev_region(tee_devt, TEE_NUM_DEVICES);
 }
 
 subsys_initcall(tee_init);

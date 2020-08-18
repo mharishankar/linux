@@ -1,15 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2015, Linaro Limited
- *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -26,6 +17,7 @@
 #include <linux/tee_drv.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
+#include "optee_bench.h"
 #include "optee_private.h"
 #include "optee_smc.h"
 #include "shm_pool.h"
@@ -224,6 +216,10 @@ static void optee_get_version(struct tee_device *teedev,
 
 	if (optee->sec_caps & OPTEE_SMC_SEC_CAP_DYNAMIC_SHM)
 		v.gen_caps |= TEE_GEN_CAP_REG_MEM;
+	if (optee->sec_caps & OPTEE_SMC_SEC_CAP_MEMREF_NULL)
+		v.gen_caps |= TEE_GEN_CAP_MEMREF_NULL;
+	if (optee->sec_caps & OPTEE_SMC_SEC_CAP_OCALL)
+		v.gen_caps |= TEE_GEN_CAP_OCALL;
 	*vers = v;
 }
 
@@ -254,6 +250,10 @@ static int optee_open(struct tee_context *ctx)
 
 	mutex_init(&ctxdata->mutex);
 	INIT_LIST_HEAD(&ctxdata->sess_list);
+	idr_init(&ctxdata->tmp_sess_list);
+
+	ctx->cap_memref_null = optee->sec_caps & OPTEE_SMC_SEC_CAP_MEMREF_NULL;
+	ctx->cap_ocall = optee->sec_caps & OPTEE_SMC_SEC_CAP_OCALL;
 
 	ctx->data = ctxdata;
 	return 0;
@@ -298,6 +298,7 @@ static void optee_release(struct tee_context *ctx)
 		}
 		kfree(sess);
 	}
+	idr_destroy(&ctxdata->tmp_sess_list);
 	kfree(ctxdata);
 
 	if (!IS_ERR(shm))
@@ -309,9 +310,34 @@ static void optee_release(struct tee_context *ctx)
 		optee_supp_release(&optee->supp);
 }
 
+static void optee_pre_release(struct tee_context *ctx)
+{
+	struct optee_context_data *ctxdata = ctx->data;
+	struct optee_session *sess;
+	int id;
+
+	if (!ctxdata)
+		return;
+
+	mutex_lock(&ctxdata->mutex);
+	idr_for_each_entry(&ctxdata->tmp_sess_list, sess, id) {
+		idr_remove(&ctxdata->tmp_sess_list, id);
+		optee_cancel_open_session_ocall(sess);
+	}
+	list_for_each_entry(sess, &ctxdata->sess_list, list_node) {
+		if (sess->call_ctx.rpc_shm) {
+			down(&sess->sem);
+			optee_cancel_invoke_function_ocall(&sess->call_ctx);
+			up(&sess->sem);
+		}
+	}
+	mutex_unlock(&ctxdata->mutex);
+}
+
 static const struct tee_driver_ops optee_ops = {
 	.get_version = optee_get_version,
 	.open = optee_open,
+	.pre_release = optee_pre_release,
 	.release = optee_release,
 	.open_session = optee_open_session,
 	.close_session = optee_close_session,
@@ -419,9 +445,35 @@ static bool optee_msg_exchange_capabilities(optee_invoke_fn *invoke_fn,
 	return true;
 }
 
+static struct tee_shm_pool *optee_config_dyn_shm(void)
+{
+	struct tee_shm_pool_mgr *priv_mgr;
+	struct tee_shm_pool_mgr *dmabuf_mgr;
+	void *rc;
+
+	rc = optee_shm_pool_alloc_pages();
+	if (IS_ERR(rc))
+		return rc;
+	priv_mgr = rc;
+
+	rc = optee_shm_pool_alloc_pages();
+	if (IS_ERR(rc)) {
+		tee_shm_pool_mgr_destroy(priv_mgr);
+		return rc;
+	}
+	dmabuf_mgr = rc;
+
+	rc = tee_shm_pool_alloc(priv_mgr, dmabuf_mgr);
+	if (IS_ERR(rc)) {
+		tee_shm_pool_mgr_destroy(priv_mgr);
+		tee_shm_pool_mgr_destroy(dmabuf_mgr);
+	}
+
+	return rc;
+}
+
 static struct tee_shm_pool *
-optee_config_shm_memremap(optee_invoke_fn *invoke_fn, void **memremaped_shm,
-			  u32 sec_caps)
+optee_config_shm_memremap(optee_invoke_fn *invoke_fn, void **memremaped_shm)
 {
 	union {
 		struct arm_smccc_res smccc;
@@ -436,10 +488,11 @@ optee_config_shm_memremap(optee_invoke_fn *invoke_fn, void **memremaped_shm,
 	struct tee_shm_pool_mgr *priv_mgr;
 	struct tee_shm_pool_mgr *dmabuf_mgr;
 	void *rc;
+	const int sz = OPTEE_SHM_NUM_PRIV_PAGES * PAGE_SIZE;
 
 	invoke_fn(OPTEE_SMC_GET_SHM_CONFIG, 0, 0, 0, 0, 0, 0, 0, &res.smccc);
 	if (res.result.status != OPTEE_SMC_RETURN_OK) {
-		pr_info("shm service not available\n");
+		pr_err("static shm service not available\n");
 		return ERR_PTR(-ENOENT);
 	}
 
@@ -465,28 +518,15 @@ optee_config_shm_memremap(optee_invoke_fn *invoke_fn, void **memremaped_shm,
 	}
 	vaddr = (unsigned long)va;
 
-	/*
-	 * If OP-TEE can work with unregistered SHM, we will use own pool
-	 * for private shm
-	 */
-	if (sec_caps & OPTEE_SMC_SEC_CAP_DYNAMIC_SHM) {
-		rc = optee_shm_pool_alloc_pages();
-		if (IS_ERR(rc))
-			goto err_memunmap;
-		priv_mgr = rc;
-	} else {
-		const size_t sz = OPTEE_SHM_NUM_PRIV_PAGES * PAGE_SIZE;
+	rc = tee_shm_pool_mgr_alloc_res_mem(vaddr, paddr, sz,
+					    3 /* 8 bytes aligned */);
+	if (IS_ERR(rc))
+		goto err_memunmap;
+	priv_mgr = rc;
 
-		rc = tee_shm_pool_mgr_alloc_res_mem(vaddr, paddr, sz,
-						    3 /* 8 bytes aligned */);
-		if (IS_ERR(rc))
-			goto err_memunmap;
-		priv_mgr = rc;
-
-		vaddr += sz;
-		paddr += sz;
-		size -= sz;
-	}
+	vaddr += sz;
+	paddr += sz;
+	size -= sz;
 
 	rc = tee_shm_pool_mgr_alloc_res_mem(vaddr, paddr, size, PAGE_SHIFT);
 	if (IS_ERR(rc))
@@ -552,7 +592,7 @@ static optee_invoke_fn *get_invoke_func(struct device_node *np)
 static struct optee *optee_probe(struct device_node *np)
 {
 	optee_invoke_fn *invoke_fn;
-	struct tee_shm_pool *pool;
+	struct tee_shm_pool *pool = ERR_PTR(-EINVAL);
 	struct optee *optee = NULL;
 	void *memremaped_shm = NULL;
 	struct tee_device *teedev;
@@ -581,13 +621,17 @@ static struct optee *optee_probe(struct device_node *np)
 	}
 
 	/*
-	 * We have no other option for shared memory, if secure world
-	 * doesn't have any reserved memory we can use we can't continue.
+	 * Try to use dynamic shared memory if possible
 	 */
-	if (!(sec_caps & OPTEE_SMC_SEC_CAP_HAVE_RESERVED_SHM))
-		return ERR_PTR(-EINVAL);
+	if (sec_caps & OPTEE_SMC_SEC_CAP_DYNAMIC_SHM)
+		pool = optee_config_dyn_shm();
 
-	pool = optee_config_shm_memremap(invoke_fn, &memremaped_shm, sec_caps);
+	/*
+	 * If dynamic shared memory is not available or failed - try static one
+	 */
+	if (IS_ERR(pool) && (sec_caps & OPTEE_SMC_SEC_CAP_HAVE_RESERVED_SHM))
+		pool = optee_config_shm_memremap(invoke_fn, &memremaped_shm);
+
 	if (IS_ERR(pool))
 		return (void *)pool;
 
@@ -631,7 +675,9 @@ static struct optee *optee_probe(struct device_node *np)
 
 	optee_enable_shm_cache(optee);
 
-	pr_info("initialized driver\n");
+	if (optee->sec_caps & OPTEE_SMC_SEC_CAP_DYNAMIC_SHM)
+		pr_info("dynamic shared memory is enabled\n");
+
 	return optee;
 err:
 	if (optee) {
@@ -686,9 +732,10 @@ static struct optee *optee_svc;
 
 static int __init optee_driver_init(void)
 {
-	struct device_node *fw_np;
-	struct device_node *np;
-	struct optee *optee;
+	struct device_node *fw_np = NULL;
+	struct device_node *np = NULL;
+	struct optee *optee = NULL;
+	int rc = 0;
 
 	/* Node is supposed to be below /firmware */
 	fw_np = of_find_node_by_name(NULL, "firmware");
@@ -696,8 +743,10 @@ static int __init optee_driver_init(void)
 		return -ENODEV;
 
 	np = of_find_matching_node(fw_np, optee_match);
-	if (!np)
+	if (!np || !of_device_is_available(np)) {
+		of_node_put(np);
 		return -ENODEV;
+	}
 
 	optee = optee_probe(np);
 	of_node_put(np);
@@ -705,7 +754,17 @@ static int __init optee_driver_init(void)
 	if (IS_ERR(optee))
 		return PTR_ERR(optee);
 
+	rc = optee_enumerate_devices();
+	if (rc) {
+		optee_remove(optee);
+		return rc;
+	}
+
+	pr_info("initialized driver\n");
+
 	optee_svc = optee;
+
+	optee_bm_enable();
 
 	return 0;
 }
@@ -718,6 +777,8 @@ static void __exit optee_driver_exit(void)
 	optee_svc = NULL;
 	if (optee)
 		optee_remove(optee);
+
+	optee_bm_disable();
 }
 module_exit(optee_driver_exit);
 
